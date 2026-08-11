@@ -36,8 +36,10 @@ struct ArnTarget {
 	//! Storage extension the ATTACH is dispatched to
 	string backend;
 	string path;
-	//! Injected into AttachInfo::options and the already-bound AttachOptions
-	case_insensitive_map_t<Value> options;
+	//! Derived from the ARN and therefore not user-overridable
+	case_insensitive_map_t<Value> fixed_options;
+	//! Derived defaults which may be overridden explicitly
+	case_insensitive_map_t<Value> default_options;
 	//! False when the backend ships in this same aws extension
 	bool autoload = true;
 };
@@ -75,12 +77,111 @@ static ParsedArn ParseArn(const string &arn) {
 	return result;
 }
 
-//! The iceberg extension takes the full ARN as its warehouse, and reads endpoint_type
-static ArnTarget S3TablesTarget(const ParsedArn &arn) {
-	ArnTarget target;
+static string DnsSuffix(const ParsedArn &arn) {
+	static const case_insensitive_map_t<string> suffixes {
+	    {"aws", "amazonaws.com"},        {"aws-cn", "amazonaws.com.cn"},  {"aws-eusc", "amazonaws.eu"},
+	    {"aws-iso", "c2s.ic.gov"},       {"aws-iso-b", "sc2s.sgov.gov"},  {"aws-iso-e", "cloud.adc-e.uk"},
+	    {"aws-iso-f", "csp.hci.ic.gov"}, {"aws-us-gov", "amazonaws.com"},
+	};
+	auto entry = suffixes.find(arn.partition);
+	if (entry == suffixes.end()) {
+		throw InvalidInputException("AWS ARN '%s' uses unknown partition '%s'", arn.raw, arn.partition);
+	}
+	return entry->second;
+}
+
+static void ValidateRegionalAccountArn(const ParsedArn &arn, const string &service_name) {
+	if (arn.region.empty()) {
+		throw InvalidInputException("%s ARN '%s' does not specify a region", service_name, arn.raw);
+	}
+	if (arn.account_id.size() != 12 ||
+	    !std::all_of(arn.account_id.begin(), arn.account_id.end(), [](char c) { return c >= '0' && c <= '9'; })) {
+		throw InvalidInputException("%s ARN '%s' does not contain a 12-digit account ID", service_name, arn.raw);
+	}
+}
+
+static Value SupportedEndpoints(std::initializer_list<const char *> endpoints) {
+	vector<Value> values;
+	for (auto endpoint : endpoints) {
+		values.emplace_back(endpoint);
+	}
+	return Value::LIST(LogicalType::VARCHAR, std::move(values));
+}
+
+static void SetIcebergDefaults(ArnTarget &target, const ParsedArn &arn, const string &service,
+                               const Value &supported_endpoints) {
+	auto dns_suffix = DnsSuffix(arn);
 	target.backend = "iceberg";
 	target.path = arn.raw;
-	target.options["endpoint_type"] = Value("s3_tables");
+	target.default_options["uri"] = Value(StringUtil::Format("%s.%s.%s/iceberg", service, arn.region, dns_suffix));
+	target.fixed_options["authorization_type"] = Value("sigv4");
+	target.fixed_options["sigv4_service"] = Value(service);
+	target.fixed_options["sigv4_region"] = Value(arn.region);
+	target.fixed_options["supported_endpoints"] = supported_endpoints;
+	target.fixed_options["storage_region"] = Value(arn.region);
+	target.fixed_options["storage_endpoint"] = Value(StringUtil::Format("s3.%s.%s", arn.region, dns_suffix));
+	target.fixed_options["remove_files_on_delete"] = Value::BOOLEAN(false);
+	target.fixed_options["stage_create_tables"] = Value::BOOLEAN(false);
+	target.fixed_options["purge_requested"] = Value::BOOLEAN(true);
+}
+
+static Value S3TablesEndpoints() {
+	return SupportedEndpoints(
+	    {"GET /v1/{prefix}/namespaces", "POST /v1/{prefix}/namespaces", "GET /v1/{prefix}/namespaces/{namespace}",
+	     "DELETE /v1/{prefix}/namespaces/{namespace}", "GET /v1/{prefix}/namespaces/{namespace}/tables",
+	     "POST /v1/{prefix}/namespaces/{namespace}/tables", "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+	     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+	     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}", "POST /v1/{prefix}/tables/rename",
+	     "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}", "HEAD /v1/{prefix}/namespaces/{namespace}"});
+}
+
+static Value GlueEndpoints() {
+	return SupportedEndpoints(
+	    {"GET /v1/{prefix}/namespaces", "POST /v1/{prefix}/namespaces", "GET /v1/{prefix}/namespaces/{namespace}",
+	     "DELETE /v1/{prefix}/namespaces/{namespace}", "GET /v1/{prefix}/namespaces/{namespace}/tables",
+	     "POST /v1/{prefix}/namespaces/{namespace}/tables", "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+	     "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+	     "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+	     "DELETE /v1/{prefix}/namespaces/{namespace}/tables/{table}"});
+}
+
+static ArnTarget S3TablesTarget(const ParsedArn &arn) {
+	ValidateRegionalAccountArn(arn, "S3 Tables");
+	static const string prefix = "bucket/";
+	if (!StringUtil::StartsWith(arn.resource, prefix) || arn.resource.size() == prefix.size() ||
+	    arn.resource.find('/', prefix.size()) != string::npos) {
+		throw InvalidInputException(
+		    "Expected an S3 Tables table-bucket ARN with a resource of the form 'bucket/<bucket-name>', got '%s'",
+		    arn.raw);
+	}
+	ArnTarget target;
+	SetIcebergDefaults(target, arn, "s3tables", S3TablesEndpoints());
+	target.fixed_options["warehouse"] = Value(arn.raw);
+	target.fixed_options["storage_credential_source"] = Value("catalog");
+	return target;
+}
+
+static ArnTarget GlueTarget(const ParsedArn &arn) {
+	ValidateRegionalAccountArn(arn, "Glue");
+	static const string nested_prefix = "catalog/";
+	string warehouse;
+	if (arn.resource == "catalog") {
+		warehouse = arn.account_id;
+	} else if (StringUtil::StartsWith(arn.resource, nested_prefix) && arn.resource.size() > nested_prefix.size()) {
+		auto nested_path = arn.resource.substr(nested_prefix.size());
+		if (StringUtil::Contains(nested_path, "//") || nested_path.back() == '/') {
+			throw InvalidInputException("Glue catalog ARN '%s' contains an empty nested catalog component", arn.raw);
+		}
+		warehouse = arn.account_id + ":" + nested_path;
+	} else {
+		throw InvalidInputException(
+		    "Expected a Glue catalog ARN with a resource of the form 'catalog' or 'catalog/<nested-path>', got '%s'",
+		    arn.raw);
+	}
+
+	ArnTarget target;
+	SetIcebergDefaults(target, arn, "glue", GlueEndpoints());
+	target.fixed_options["warehouse"] = Value(warehouse);
 	return target;
 }
 
@@ -103,7 +204,7 @@ static ArnTarget RDSTarget(const ParsedArn &arn) {
 	ArnTarget target;
 	target.backend = "rds";
 	target.path = RdsInstanceId(arn);
-	target.options["region"] = Value(arn.region);
+	target.fixed_options["region"] = Value(arn.region);
 	target.autoload = false;
 	return target;
 }
@@ -129,9 +230,9 @@ static ArnTarget RedshiftTarget(const ParsedArn &arn) {
 	ArnTarget target;
 	target.backend = "redshift";
 	target.path = RedshiftNamespaceResource(arn);
-	target.options["region"] = Value(arn.region);
-	target.options["account_id"] = Value(arn.account_id);
-	target.options["resource"] = Value(arn.resource);
+	target.fixed_options["region"] = Value(arn.region);
+	target.fixed_options["account_id"] = Value(arn.account_id);
+	target.fixed_options["resource"] = Value(arn.resource);
 	target.autoload = false;
 	return target;
 }
@@ -139,6 +240,7 @@ static ArnTarget RedshiftTarget(const ParsedArn &arn) {
 static const case_insensitive_map_t<arn_handler_t> &ArnServiceHandlers() {
 	static const case_insensitive_map_t<arn_handler_t> handlers {
 	    {"s3tables", S3TablesTarget},
+	    {"glue", GlueTarget},
 	    {"rds", RDSTarget},
 	    {"redshift", RedshiftTarget},
 	};
@@ -181,18 +283,40 @@ static optional_ptr<StorageExtension> GetBackend(AttachedDatabase &db, const Arn
 	return backend;
 }
 
-//! The ARN determines these options, so setting them in ATTACH is always an error, even to the same value.
-//! Keys in info.options preserve the case the user typed, hence the case-insensitive scan.
+////! The ARN determines these options, so setting them in ATTACH is always an error, even to the same value.
+////! Keys in info.options preserve the case the user typed, hence the case-insensitive scan.
+//static void ApplyTargetOptions(AttachInfo &info, AttachOptions &options, const ArnTarget &target) {
+//	for (auto &option : target.options) {
+//}
+
+static bool HasOption(const AttachInfo &info, const string &name) {
+	for (auto &existing : info.options) {
+		if (StringUtil::CIEquals(existing.first, name)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+static void AddOption(AttachInfo &info, AttachOptions &options, const string &name, const Value &value) {
+	info.options[name] = value;
+	options.options[name] = value;
+}
+
 static void ApplyTargetOptions(AttachInfo &info, AttachOptions &options, const ArnTarget &target) {
-	for (auto &option : target.options) {
+	for (auto &option : target.fixed_options) {
 		for (auto &existing : info.options) {
 			if (StringUtil::CIEquals(existing.first, option.first)) {
 				throw InvalidInputException("ATTACH option '%s' is derived from the ARN and cannot be set explicitly",
 				                            existing.first);
 			}
 		}
-		info.options[option.first] = option.second;
-		options.options[option.first] = option.second;
+		AddOption(info, options, option.first, option.second);
+	}
+	for (auto &option : target.default_options) {
+		if (!HasOption(info, option.first)) {
+			AddOption(info, options, option.first, option.second);
+		}
 	}
 }
 

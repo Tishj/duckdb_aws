@@ -66,8 +66,33 @@ set autoinstall_known_extensions = false;
 statement ok
 set autoload_known_extensions = false;
 
-# Correctly delegates to iceberg, fails to load because we haven't 'require'd it in this test
 statement error
 ATTACH 'arn:aws:s3tables:::' as db;
 ----
-<REGEX>:.*iceberg.*
+Invalid Input Error: S3 Tables ARN 'arn:aws:s3tables:::' does not specify a region
+
+statement error
+ATTACH 'arn:aws:s3tables:us-east-1:123456789012:bucket/test-bucket/table/table-id' AS db;
+----
+Invalid Input Error: Expected an S3 Tables table-bucket ARN with a resource of the form 'bucket/<bucket-name>', got 'arn:aws:s3tables:us-east-1:123456789012:bucket/test-bucket/table/table-id'
+
+statement error
+ATTACH 'arn:aws:s3tables:us-east-1:1234:bucket/test-bucket' AS db;
+----
+Invalid Input Error: S3 Tables ARN 'arn:aws:s3tables:us-east-1:1234:bucket/test-bucket' does not contain a 12-digit account ID
+
+statement error
+ATTACH 'arn:unknown:s3tables:us-east-1:123456789012:bucket/test-bucket' AS db;
+----
+Invalid Input Error: AWS ARN 'arn:unknown:s3tables:us-east-1:123456789012:bucket/test-bucket' uses unknown partition 'unknown'
+
+statement error
+ATTACH 'arn:aws:glue:us-east-1:123456789012:database/default' AS db;
+----
+Invalid Input Error: Expected a Glue catalog ARN with a resource of the form 'catalog' or 'catalog/<nested-path>', got 'arn:aws:glue:us-east-1:123456789012:database/default'
+
+# Warehouse and signing inputs are fixed by the ARN.
+statement error
+ATTACH 'arn:aws:glue:us-east-1:123456789012:catalog' AS db (WAREHOUSE 'other');
+----
+Invalid Input Error: ATTACH option 'warehouse' is derived from the ARN and cannot be set explicitly
